@@ -1,7 +1,8 @@
 # Third-Party Notices
 
-DriveStitch uses the following third-party components. They are governed by
-their own licenses, which are unaffected by this repository's MIT license.
+DriveStitch's own code and assets are licensed under the repository's MIT
+license (see [LICENSE](LICENSE)). The third-party components below are
+governed by their own licenses, which are unaffected by that MIT license.
 
 ## PySide6 and shiboken6 (Qt for Python)
 

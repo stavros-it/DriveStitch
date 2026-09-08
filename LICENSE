@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This license applies to DriveStitch's own code and assets. Third-party
-components used by the project (PySide6/Qt, Pillow) are governed by their
-own licenses - see THIRD-PARTY-NOTICES.md.
