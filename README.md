@@ -4,6 +4,15 @@
   <img src="icon.png" alt="DriveStitch icon" width="128" />
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/stavros-it/DriveStitch?label=license" alt="License"></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+"></a>
+  <a href="https://www.qt.io/qt-for-python"><img src="https://img.shields.io/badge/GUI-PySide6%20(Qt)-41CD52?logo=qt&logoColor=white" alt="PySide6"></a>
+  <a href="https://learn.microsoft.com/powershell"><img src="https://img.shields.io/badge/engine-PowerShell-5391FE?logo=powershell&logoColor=white" alt="PowerShell"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows11" alt="Windows 10/11">
+  <img src="https://img.shields.io/github/stars/stavros-it/DriveStitch?style=flat" alt="Stars">
+</p>
+
 Standalone failing-disk rescue tool with a PySide6 GUI. Maps a failing disk's
 readable vs damaged regions with read-only watchdog-protected probes, then
 copies files off it — skipping damaged areas (zero-filled) instead of stalling
