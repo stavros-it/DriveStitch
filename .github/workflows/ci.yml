@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Python compile check
+        run: python -m compileall -q app_window.py disks.py runner.py scripts.py make_icon.py DriveStitch.pyw
+
+      - name: Engine load + worker protocol smoke
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . ./engine/DiskRescueLib.ps1
+          foreach ($t in 'DiskRescueIo.DriveProbe','DiskRescueIo.FileChunkReader','DiskRescueIo.NtfsLayout') {
+              if (-not ($t -as [type])) { throw "missing native type: $t" }
+          }
+          $state = New-DiskRescueWorkerState
+          $r = Invoke-DiskRescueWorkerCommand -Command 'PING' -State $state
+          if ($r -ne 'PONG') { throw "PING -> $r" }
+          $tmp = Join-Path $env:TEMP ('drivestitch-ci-{0}.bin' -f [guid]::NewGuid().ToString('N'))
+          $payload = New-Object byte[] 4096
+          (New-Object Random 1234).NextBytes($payload)
+          [IO.File]::WriteAllBytes($tmp, $payload)
+          $r = Invoke-DiskRescueWorkerCommand -Command ('OPENFILE ' + $tmp) -State $state
+          if ($r -notmatch '^OK (\d+)$') { throw "OPENFILE -> $r" }
+          $id = [int]$Matches[1]
+          $r = Invoke-DiskRescueWorkerCommand -Command ('READ {0} 0 4096 5000 2000 1' -f $id) -State $state
+          if ($r -notmatch ('^OK {0} Good 4096 0 \d+ ([A-Za-z0-9+/=]+)(?: .*)?$' -f $id)) { throw "READ -> $r" }
+          if ([Convert]::ToBase64String([Convert]::FromBase64String($Matches[1])) -ne [Convert]::ToBase64String($payload)) { throw 'base64 chunk mismatch' }
+          $r = Invoke-DiskRescueWorkerCommand -Command ('CLOSE {0}' -f $id) -State $state
+          if ($r -ne ('OK {0}' -f $id)) { throw "CLOSE -> $r" }
+          $r = Invoke-DiskRescueWorkerCommand -Command ('READ {0} 0 512 5000 2000 0' -f $id) -State $state
+          if ($r -notlike 'ERR*') { throw "READ after CLOSE -> $r" }
+          $r = Invoke-DiskRescueWorkerCommand -Command 'FLY 2 THE MOON' -State $state
+          if ($r -notlike 'ERR*') { throw "unknown command -> $r" }
+          Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+          Write-Output 'ENGINE SMOKE OK'
+
+      - name: GUI selftest (offscreen)
+        run: python DriveStitch.pyw --selftest

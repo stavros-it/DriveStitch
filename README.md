@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/stavros-it/DriveStitch/actions/workflows/ci.yml"><img src="https://github.com/stavros-it/DriveStitch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+"></a>
   <a href="https://www.qt.io/qt-for-python"><img src="https://img.shields.io/badge/GUI-PySide6%20(Qt)-41CD52?logo=qt&logoColor=white" alt="PySide6"></a>
