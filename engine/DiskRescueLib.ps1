@@ -1,5 +1,5 @@
 # DiskRescueLib.ps1 - failing-disk mapper and bad-aware file copier.
-# Original work, Copyright (c) 2026 Stavros Antoniou. All rights reserved.
+# Copyright (c) 2026 Stavros Antoniou. MIT License - see LICENSE.
 #
 # A failing HDD often stalls whole-file copies on a handful of unreadable
 # sectors. This library takes a different approach in two phases:
@@ -27,10 +27,11 @@ $script:GiB = [int64]1073741824
 $script:DiskRescueDataDir = ''
 
 # ---------------------------------------------------------------------------
-# Native helpers (original C#, documented Win32 APIs only)
+# Native I/O helpers - clean-room C# written from the documented Win32 APIs
+# (independent implementation, no third-party code).
 # ---------------------------------------------------------------------------
 
-$script:DiskRescueNative = @'
+$script:DiskRescueIo = @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -39,26 +40,13 @@ using System.IO;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace DiskRescueNative
+namespace DiskRescueIo
 {
-    public sealed class GeometryInfo
+    // Outcome of one watchdog-protected read. Status: Good | Timeout | Error.
+    // Win32Error carries the driver error code (1460 = watchdog timeout).
+    public sealed class ReadReport
     {
-        public long DiskSizeBytes;
-        public int BytesPerSector;
-    }
-
-    public sealed class ProbeResult
-    {
-        public string Status;       // Good | Timeout | Error
-        public int BytesRead;
-        public long DurationMs;
-        public int Win32Error;
-        public string Message;
-    }
-
-    public sealed class ChunkResult
-    {
-        public string Status;       // Good | Timeout | Error
+        public string Status;
         public byte[] Data;
         public int BytesRead;
         public long DurationMs;
@@ -66,33 +54,34 @@ namespace DiskRescueNative
         public string Message;
     }
 
-    // Raw read-only session on \\.\PhysicalDriveN with watchdog timeouts.
-    // A hung read is cancelled via CancelIoEx; if the driver never completes
-    // the cancellation the old request memory is intentionally retained and
-    // the handle is reopened so scanning can continue elsewhere.
-    public sealed class RawDiskSession : IDisposable
+    // Capacity and sector size of a physical drive.
+    public sealed class DriveGeometry
     {
-        private const uint GENERIC_READ = 0x80000000;
-        private const uint FILE_SHARE_READ = 0x1;
-        private const uint FILE_SHARE_WRITE = 0x2;
-        private const uint OPEN_EXISTING = 3;
-        private const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
-        private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
-        private const uint IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0;
-        private const int ERROR_IO_PENDING = 997;
-        private const uint WAIT_OBJECT_0 = 0;
-        private const uint WAIT_TIMEOUT = 0x00000102;
-        private const uint MEM_COMMIT = 0x1000;
-        private const uint MEM_RESERVE = 0x2000;
-        private const uint MEM_RELEASE = 0x8000;
-        private const uint PAGE_READWRITE = 0x04;
+        public long CapacityBytes;
+        public int SectorSize;
+    }
 
-        private readonly string _path;
-        private IntPtr _handle;
-        private bool _disposed;
+    // Single declaration point for the Win32 surface used below.
+    internal static class Win
+    {
+        public const uint GENERIC_READ = 0x80000000;
+        public const uint FILE_SHARE_READ = 0x1;
+        public const uint FILE_SHARE_WRITE = 0x2;
+        public const uint FILE_SHARE_DELETE = 0x4;
+        public const uint OPEN_EXISTING = 3;
+        public const uint FILE_FLAG_NO_BUFFERING = 0x20000000;
+        public const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+        public const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        public const uint IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0;
+        public const uint FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073;
+        public const int ERROR_IO_PENDING = 997;
+        public const int ERROR_HANDLE_EOF = 38;
+        public const int ERROR_MORE_DATA = 234;
+        public const int ERROR_TIMEOUT = 1460;
+        public const uint WAIT_OBJECT_0 = 0;
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct OVERLAPPED
+        public struct Overlapped
         {
             public IntPtr Internal;
             public IntPtr InternalHigh;
@@ -101,534 +90,378 @@ namespace DiskRescueNative
             public IntPtr hEvent;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DiskGeometryPrefix
+        {
+            public long Cylinders;
+            public int MediaType;
+            public int TracksPerCylinder;
+            public int SectorsPerTrack;
+            public int BytesPerSector;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr CreateFileW(string name, uint access, uint share,
+        public static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
             IntPtr security, uint creation, uint flags, IntPtr template);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ReadFile(IntPtr hFile, IntPtr buffer, uint toRead,
+        public static extern bool ReadFile(SafeFileHandle file, IntPtr buffer, uint toRead,
             IntPtr readRef, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeviceIoControl(IntPtr hDevice, uint code,
-            IntPtr inBuf, uint inSize, IntPtr outBuf, uint outSize,
+        public static extern bool DeviceIoControl(SafeFileHandle file, uint code,
+            byte[] inBuf, int inSize, IntPtr outBuf, int outSize,
             out uint returned, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetOverlappedResult(IntPtr hFile, IntPtr overlapped,
+        public static extern bool DeviceIoControl(SafeFileHandle file, uint code,
+            byte[] inBuf, int inSize, byte[] outBuf, int outSize,
+            out int returned, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetOverlappedResult(SafeFileHandle file, IntPtr overlapped,
             out uint transferred, bool wait);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CancelIoEx(IntPtr hFile, IntPtr overlapped);
+        public static extern bool CancelIoEx(SafeFileHandle file, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateEventW(IntPtr attrs, bool manualReset,
+        public static extern IntPtr CreateEventW(IntPtr attrs, bool manualReset,
             bool initialState, string name);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        public static extern uint WaitForSingleObject(IntPtr handle, uint ms);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr h);
+        public static extern bool CloseHandle(IntPtr handle);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size,
-            uint type, uint protect);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool VirtualFree(IntPtr addr, UIntPtr size, uint type);
+        public static extern bool GetDiskFreeSpaceW(string root, out int sectorsPerCluster,
+            out int bytesPerSector, out int freeClusters, out int totalClusters);
+    }
 
-        private IntPtr OpenRead()
+    // Runs one overlapped read under the watchdog: wait up to timeoutMs for
+    // the driver, then cancel and wait cancelGraceMs more. A driver that
+    // ignores the cancellation keeps kernel ownership of the request block -
+    // that memory is dropped on purpose (freeing it would corrupt the
+    // in-flight request) and the caller is told to recycle its handle.
+    internal static class Watchdog
+    {
+        public static ReadReport Read(SafeFileHandle file, long offset, int length,
+            int timeoutMs, int cancelGraceMs, bool copyOut, out bool wedged)
         {
-            IntPtr h = CreateFileW(_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
-                IntPtr.Zero);
-            if (h == new IntPtr(-1) || h == IntPtr.Zero)
-                throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "Unable to open " + _path + " for reading. Administrator rights and a valid disk number are required.");
-            return h;
-        }
-
-        public RawDiskSession(int diskNumber)
-        {
-            _path = @"\\.\PhysicalDrive" + diskNumber;
-            _handle = OpenRead();
-        }
-
-        public bool Reopen()
-        {
-            IntPtr old = _handle;
-            _handle = IntPtr.Zero;
-            if (old != IntPtr.Zero && old != new IntPtr(-1)) CloseHandle(old);
-            try { _handle = OpenRead(); return true; }
-            catch { _handle = IntPtr.Zero; return false; }
-        }
-
-        public GeometryInfo GetGeometry()
-        {
-            IntPtr buf = Marshal.AllocHGlobal(1024);
+            var report = new ReadReport { Status = "Error", Message = "" };
+            wedged = false;
+            IntPtr block = IntPtr.Zero, slot = IntPtr.Zero, signal = IntPtr.Zero;
+            bool inFlight = false;
+            var clock = Stopwatch.StartNew();
             try
             {
-                uint returned;
-                if (!DeviceIoControl(_handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                    IntPtr.Zero, 0, buf, 1024, out returned, IntPtr.Zero))
+                signal = Win.CreateEventW(IntPtr.Zero, true, false, null);
+                if (signal == IntPtr.Zero)
                     throw new Win32Exception(Marshal.GetLastWin32Error(),
-                        "IOCTL_DISK_GET_DRIVE_GEOMETRY_EX failed.");
-                int bps = Marshal.ReadInt32(buf, 20);
-                long size = Marshal.ReadInt64(buf, 24);
-                if (bps <= 0 || size <= 0)
-                    throw new InvalidOperationException("Invalid disk geometry.");
-                return new GeometryInfo { BytesPerSector = bps, DiskSizeBytes = size };
-            }
-            finally { Marshal.FreeHGlobal(buf); }
-        }
+                        "A completion event could not be created.");
+                block = Marshal.AllocHGlobal(length);
+                slot = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Win.Overlapped)));
+                var op = new Win.Overlapped();
+                op.Offset = unchecked((uint)(offset & 0xFFFFFFFFL));
+                op.OffsetHigh = unchecked((uint)((ulong)offset >> 32));
+                op.hEvent = signal;
+                Marshal.StructureToPtr(op, slot, false);
 
-        public ProbeResult ReadAt(long offset, int length, int timeoutMs, int cancelWaitMs)
-        {
-            var result = new ProbeResult
-            {
-                Status = "Error", BytesRead = 0, DurationMs = 0,
-                Win32Error = 0, Message = ""
-            };
-            IntPtr buffer = IntPtr.Zero, ev = IntPtr.Zero, ovPtr = IntPtr.Zero;
-            bool pending = false;
-            var watch = Stopwatch.StartNew();
-            try
-            {
-                buffer = VirtualAlloc(IntPtr.Zero, new UIntPtr((uint)length),
-                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (buffer == IntPtr.Zero)
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "VirtualAlloc failed.");
-                ev = CreateEventW(IntPtr.Zero, true, false, null);
-                if (ev == IntPtr.Zero)
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateEvent failed.");
-                var ov = new OVERLAPPED();
-                ov.Offset = unchecked((uint)(offset & 0xFFFFFFFF));
-                ov.OffsetHigh = unchecked((uint)((ulong)offset >> 32));
-                ov.hEvent = ev;
-                ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(OVERLAPPED)));
-                Marshal.StructureToPtr(ov, ovPtr, false);
-
-                if (ReadFile(_handle, buffer, unchecked((uint)length), IntPtr.Zero, ovPtr))
+                if (Win.ReadFile(file, block, unchecked((uint)length), IntPtr.Zero, slot))
                 {
-                    uint got;
-                    if (!GetOverlappedResult(_handle, ovPtr, out got, false))
-                    {
-                        int err = Marshal.GetLastWin32Error();
-                        result.Win32Error = err;
-                        result.Message = new Win32Exception(err).Message;
-                    }
-                    else
-                    {
-                        result.Status = "Good";
-                        result.BytesRead = unchecked((int)got);
-                    }
-                    return result;
+                    Harvest(file, slot, block, length, copyOut, report);
+                    return report;
                 }
-                int start = Marshal.GetLastWin32Error();
-                if (start != ERROR_IO_PENDING)
+                int immediate = Marshal.GetLastWin32Error();
+                if (immediate != Win.ERROR_IO_PENDING)
                 {
-                    result.Win32Error = start;
-                    result.Message = new Win32Exception(start).Message;
-                    return result;
+                    report.Win32Error = immediate;
+                    report.Message = new Win32Exception(immediate).Message;
+                    return report;
                 }
-                pending = true;
-                uint wait = WaitForSingleObject(ev, unchecked((uint)timeoutMs));
-                if (wait == WAIT_OBJECT_0)
+                inFlight = true;
+                if (Win.WaitForSingleObject(signal, unchecked((uint)timeoutMs)) == Win.WAIT_OBJECT_0)
                 {
-                    pending = false;
-                    uint got;
-                    if (!GetOverlappedResult(_handle, ovPtr, out got, false))
-                    {
-                        result.Status = "Error";
-                        result.Win32Error = Marshal.GetLastWin32Error();
-                        result.Message = new Win32Exception(result.Win32Error).Message;
-                    }
-                    else
-                    {
-                        result.Status = got == (uint)length ? "Good" : "Error";
-                        result.BytesRead = unchecked((int)got);
-                        if (got != (uint)length) result.Message = "Short read.";
-                    }
-                    return result;
+                    inFlight = false;
+                    Harvest(file, slot, block, length, copyOut, report);
+                    return report;
                 }
-                CancelIoEx(_handle, ovPtr);
-                uint cancelWait = WaitForSingleObject(ev, unchecked((uint)cancelWaitMs));
-                if (cancelWait != WAIT_OBJECT_0)
+                Win.CancelIoEx(file, slot);
+                if (Win.WaitForSingleObject(signal, unchecked((uint)cancelGraceMs)) == Win.WAIT_OBJECT_0)
                 {
-                    // Driver never completed the cancelled request. Keep the old
-                    // request memory alive (the kernel still references it) and
-                    // swap in a fresh handle so we can keep probing elsewhere.
-                    result.Status = "Timeout";
-                    result.Win32Error = 1460;
-                    result.Message = "Read timed out and could not be cancelled; raw handle replaced.";
-                    buffer = IntPtr.Zero; ev = IntPtr.Zero; ovPtr = IntPtr.Zero;
-                    pending = false;
-                    Reopen();
-                    return result;
+                    inFlight = false;
+                    uint done;
+                    Win.GetOverlappedResult(file, slot, out done, false);
+                    report.Status = "Timeout";
+                    report.Win32Error = Win.ERROR_TIMEOUT;
+                    report.Message = "The watchdog cancelled the read.";
+                    return report;
                 }
-                pending = false;
-                uint cancelled;
-                GetOverlappedResult(_handle, ovPtr, out cancelled, false);
-                result.Status = "Timeout";
-                result.Win32Error = 1460;
-                result.Message = "Read exceeded the timeout and was cancelled.";
-                return result;
+                report.Status = "Timeout";
+                report.Win32Error = Win.ERROR_TIMEOUT;
+                report.Message = "The driver never completed the cancelled request; handle recycled.";
+                wedged = true;
+                return report;
             }
             catch (Exception ex)
             {
-                result.Status = "Error";
-                result.Message = ex.Message;
-                return result;
+                report.Status = "Error";
+                report.Message = ex.Message;
+                return report;
             }
             finally
             {
-                watch.Stop();
-                result.DurationMs = watch.ElapsedMilliseconds;
-                if (!pending)
+                clock.Stop();
+                report.DurationMs = clock.ElapsedMilliseconds;
+                if (!inFlight)
                 {
-                    if (ovPtr != IntPtr.Zero) Marshal.FreeHGlobal(ovPtr);
-                    if (ev != IntPtr.Zero) CloseHandle(ev);
-                    if (buffer != IntPtr.Zero) VirtualFree(buffer, UIntPtr.Zero, MEM_RELEASE);
+                    if (signal != IntPtr.Zero) Win.CloseHandle(signal);
+                    if (slot != IntPtr.Zero) Marshal.FreeHGlobal(slot);
+                    if (block != IntPtr.Zero) Marshal.FreeHGlobal(block);
                 }
             }
         }
 
-        public void Dispose()
+        private static void Harvest(SafeFileHandle file, IntPtr slot, IntPtr block,
+            int length, bool copyOut, ReadReport report)
         {
-            if (_disposed) return;
-            _disposed = true;
-            if (_handle != IntPtr.Zero && _handle != new IntPtr(-1)) CloseHandle(_handle);
-            _handle = IntPtr.Zero;
-            GC.SuppressFinalize(this);
+            uint moved;
+            if (!Win.GetOverlappedResult(file, slot, out moved, false))
+            {
+                report.Win32Error = Marshal.GetLastWin32Error();
+                report.Message = new Win32Exception(report.Win32Error).Message;
+                return;
+            }
+            report.BytesRead = unchecked((int)moved);
+            if (copyOut)
+            {
+                // A short tail at end-of-file is a normal, successful chunk.
+                report.Status = "Good";
+                var data = new byte[(int)moved];
+                if (moved > 0) Marshal.Copy(block, data, 0, (int)moved);
+                report.Data = data;
+                return;
+            }
+            if (moved == (uint)length)
+            {
+                report.Status = "Good";
+            }
+            else
+            {
+                report.Message = "Short read: the device returned " + moved + " of " + length + " bytes.";
+            }
         }
-
-        ~RawDiskSession() { Dispose(); }
     }
 
-    // Per-file watchdog reader. Buffered overlapped reads (no alignment
-    // constraints) so arbitrary file offsets and lengths work; a chunk that
-    // hangs longer than the timeout is cancelled instead of stalling.
-    public sealed class TimedFileReader : IDisposable
+    // Raw \\.\PhysicalDriveN prober. NO_BUFFERING reads require
+    // sector-aligned offsets (the scan layer guarantees this).
+    public sealed class DriveProbe : IDisposable
     {
-        private const uint GENERIC_READ = 0x80000000;
-        private const uint FILE_SHARE_READ = 0x1;
-        private const uint FILE_SHARE_WRITE = 0x2;
-        private const uint FILE_SHARE_DELETE = 0x4;
-        private const uint OPEN_EXISTING = 3;
-        private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
-        private const int ERROR_IO_PENDING = 997;
-        private const uint WAIT_OBJECT_0 = 0;
-        private const uint MEM_COMMIT = 0x1000;
-        private const uint MEM_RESERVE = 0x2000;
-        private const uint MEM_RELEASE = 0x8000;
-        private const uint PAGE_READWRITE = 0x04;
+        private readonly string _device;
+        private SafeFileHandle _file;
+        private bool _closed;
 
-        private readonly string _path;
-        private SafeFileHandle _handle;
-        private bool _disposed;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct OVERLAPPED
+        public DriveProbe(int diskNumber)
         {
-            public IntPtr Internal;
-            public IntPtr InternalHigh;
-            public uint Offset;
-            public uint OffsetHigh;
-            public IntPtr hEvent;
+            _device = @"\\.\PhysicalDrive" + diskNumber;
+            _file = OpenDevice();
         }
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
-            IntPtr security, uint creation, uint flags, IntPtr template);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ReadFile(SafeFileHandle h, IntPtr buffer, uint toRead,
-            IntPtr readRef, IntPtr overlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GetOverlappedResult(SafeFileHandle h, IntPtr overlapped,
-            out uint transferred, bool wait);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CancelIoEx(SafeFileHandle h, IntPtr overlapped);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateEventW(IntPtr attrs, bool manualReset,
-            bool initialState, string name);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint WaitForSingleObject(IntPtr h, uint ms);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool CloseHandle(IntPtr h);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size, uint type, uint protect);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool VirtualFree(IntPtr addr, UIntPtr size, uint type);
-
-        public TimedFileReader(string path)
+        private SafeFileHandle OpenDevice()
         {
-            _path = path;
-            _handle = OpenFile();
-        }
-
-        private SafeFileHandle OpenFile()
-        {
-            SafeFileHandle h = CreateFileW(_path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            SafeFileHandle h = Win.CreateFileW(_device, Win.GENERIC_READ,
+                Win.FILE_SHARE_READ | Win.FILE_SHARE_WRITE, IntPtr.Zero, Win.OPEN_EXISTING,
+                Win.FILE_FLAG_NO_BUFFERING | Win.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
             if (h.IsInvalid)
                 throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "Cannot open " + _path);
+                    "Cannot open " + _device + "; raw disk access needs elevation and a valid disk number.");
             return h;
         }
 
-        public bool Reopen()
+        public bool Recycle()
         {
-            SafeFileHandle old = _handle;
-            _handle = null;
-            if (old != null && !old.IsInvalid) { try { old.Dispose(); } catch { } }
-            try { _handle = OpenFile(); return !_handle.IsInvalid; }
-            catch { _handle = null; return false; }
+            SafeFileHandle old = _file;
+            _file = null;
+            if (old != null) { try { old.Dispose(); } catch { } }
+            try { _file = OpenDevice(); return true; }
+            catch { _file = null; return false; }
         }
 
-        public ChunkResult ReadAt(long offset, int length, int timeoutMs, int cancelWaitMs)
+        public DriveGeometry GetGeometry()
         {
-            var result = new ChunkResult
-            {
-                Status = "Error", Data = null, BytesRead = 0,
-                DurationMs = 0, Win32Error = 0, Message = ""
-            };
-            SafeFileHandle handle = _handle;
-            if (handle == null || handle.IsInvalid)
-            {
-                if (!Reopen()) { result.Message = "File handle unavailable."; return result; }
-                handle = _handle;
-            }
-            IntPtr buffer = IntPtr.Zero, ev = IntPtr.Zero, ovPtr = IntPtr.Zero;
-            bool pending = false;
-            var watch = Stopwatch.StartNew();
+            IntPtr geoBuf = Marshal.AllocHGlobal(1024);
             try
             {
-                buffer = VirtualAlloc(IntPtr.Zero, new UIntPtr((uint)length),
-                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (buffer == IntPtr.Zero)
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "VirtualAlloc failed.");
-                ev = CreateEventW(IntPtr.Zero, true, false, null);
-                if (ev == IntPtr.Zero)
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateEvent failed.");
-                var ov = new OVERLAPPED();
-                ov.Offset = unchecked((uint)(offset & 0xFFFFFFFF));
-                ov.OffsetHigh = unchecked((uint)((ulong)offset >> 32));
-                ov.hEvent = ev;
-                ovPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(OVERLAPPED)));
-                Marshal.StructureToPtr(ov, ovPtr, false);
-
-                if (ReadFile(handle, buffer, unchecked((uint)length), IntPtr.Zero, ovPtr))
-                {
-                    uint got;
-                    if (!GetOverlappedResult(handle, ovPtr, out got, false))
-                    {
-                        result.Win32Error = Marshal.GetLastWin32Error();
-                        result.Message = new Win32Exception(result.Win32Error).Message;
-                    }
-                    else
-                    {
-                        result.Status = "Good";
-                        result.BytesRead = unchecked((int)got);
-                        result.Data = CopyOut(buffer, (int)got);
-                    }
-                    return result;
-                }
-                int start = Marshal.GetLastWin32Error();
-                if (start != ERROR_IO_PENDING)
-                {
-                    result.Win32Error = start;
-                    result.Message = new Win32Exception(start).Message;
-                    return result;
-                }
-                pending = true;
-                uint wait = WaitForSingleObject(ev, unchecked((uint)timeoutMs));
-                if (wait == WAIT_OBJECT_0)
-                {
-                    pending = false;
-                    uint got;
-                    if (!GetOverlappedResult(handle, ovPtr, out got, false))
-                    {
-                        result.Status = "Error";
-                        result.Win32Error = Marshal.GetLastWin32Error();
-                        result.Message = new Win32Exception(result.Win32Error).Message;
-                    }
-                    else
-                    {
-                        result.Status = "Good";
-                        result.BytesRead = unchecked((int)got);
-                        result.Data = CopyOut(buffer, (int)got);
-                    }
-                    return result;
-                }
-                CancelIoEx(handle, ovPtr);
-                uint cancelWait = WaitForSingleObject(ev, unchecked((uint)cancelWaitMs));
-                if (cancelWait != WAIT_OBJECT_0)
-                {
-                    result.Status = "Timeout";
-                    result.Win32Error = 1460;
-                    result.Message = "File read timed out and could not be cancelled; handle replaced.";
-                    buffer = IntPtr.Zero; ev = IntPtr.Zero; ovPtr = IntPtr.Zero;
-                    pending = false;
-                    Reopen();
-                    return result;
-                }
-                pending = false;
-                uint cancelled;
-                GetOverlappedResult(handle, ovPtr, out cancelled, false);
-                result.Status = "Timeout";
-                result.Win32Error = 1460;
-                result.Message = "File read exceeded the timeout and was cancelled.";
-                return result;
+                uint returned;
+                if (!Win.DeviceIoControl(_file, Win.IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, null, 0,
+                    geoBuf, 1024, out returned, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "The disk did not answer the geometry query.");
+                var head = (Win.DiskGeometryPrefix)Marshal.PtrToStructure(
+                    geoBuf, typeof(Win.DiskGeometryPrefix));
+                long capacity = Marshal.ReadInt64(geoBuf, Marshal.SizeOf(typeof(Win.DiskGeometryPrefix)));
+                if (head.BytesPerSector <= 0 || capacity <= 0)
+                    throw new InvalidOperationException("The device reported an implausible geometry.");
+                return new DriveGeometry { CapacityBytes = capacity, SectorSize = head.BytesPerSector };
             }
-            catch (ObjectDisposedException)
-            {
-                result.Message = "File handle was closed.";
-                return result;
-            }
-            finally
-            {
-                watch.Stop();
-                result.DurationMs = watch.ElapsedMilliseconds;
-                if (!pending)
-                {
-                    if (ovPtr != IntPtr.Zero) Marshal.FreeHGlobal(ovPtr);
-                    if (ev != IntPtr.Zero) CloseHandle(ev);
-                    if (buffer != IntPtr.Zero) VirtualFree(buffer, UIntPtr.Zero, MEM_RELEASE);
-                }
-            }
+            finally { Marshal.FreeHGlobal(geoBuf); }
         }
 
-        private static byte[] CopyOut(IntPtr buffer, int count)
+        public ReadReport ReadAt(long offset, int length, int timeoutMs, int cancelGraceMs)
         {
-            byte[] managed = new byte[count];
-            Marshal.Copy(buffer, managed, 0, count);
-            return managed;
+            SafeFileHandle file = _file;
+            if (file == null || file.IsInvalid)
+            {
+                if (!Recycle())
+                    return new ReadReport { Status = "Error", Message = "The raw device handle could not be reopened." };
+                file = _file;
+            }
+            bool wedged;
+            ReadReport report = Watchdog.Read(file, offset, length, timeoutMs, cancelGraceMs, false, out wedged);
+            if (wedged) Recycle();
+            return report;
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-            if (_handle != null && !_handle.IsInvalid) { try { _handle.Dispose(); } catch { } }
-            _handle = null;
+            if (_closed) return;
+            _closed = true;
+            SafeFileHandle file = _file;
+            _file = null;
+            if (file != null) { try { file.Dispose(); } catch { } }
             GC.SuppressFinalize(this);
         }
     }
 
-    // NTFS physical extent lookup: FSCTL_GET_RETRIEVAL_POINTERS.
-    public static class NtfsTools
+    // Per-file chunk reader: buffered overlapped reads, so arbitrary offsets
+    // and lengths are allowed; a hanging chunk is cancelled by the watchdog.
+    public sealed class FileChunkReader : IDisposable
     {
-        private const uint GENERIC_READ = 0x80000000;
-        private const uint FILE_SHARE_READ = 0x1;
-        private const uint FILE_SHARE_WRITE = 0x2;
-        private const uint FILE_SHARE_DELETE = 0x4;
-        private const uint OPEN_EXISTING = 3;
-        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
-        private const uint FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073;
-        private const int ERROR_HANDLE_EOF = 38;
-        private const int ERROR_MORE_DATA = 234;
+        private readonly string _source;
+        private SafeFileHandle _file;
+        private bool _closed;
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct StartVcnInput { public long StartingVcn; }
+        public FileChunkReader(string path)
+        {
+            _source = path;
+            _file = OpenSource();
+        }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct RetrievalHeader { public uint ExtentCount; public long StartingVcn; }
+        private SafeFileHandle OpenSource()
+        {
+            SafeFileHandle h = Win.CreateFileW(_source, Win.GENERIC_READ,
+                Win.FILE_SHARE_READ | Win.FILE_SHARE_WRITE | Win.FILE_SHARE_DELETE,
+                IntPtr.Zero, Win.OPEN_EXISTING, Win.FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+            if (h.IsInvalid)
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "The file could not be opened: " + _source);
+            return h;
+        }
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
-            IntPtr security, uint creation, uint flags, IntPtr template);
+        public bool Recycle()
+        {
+            SafeFileHandle old = _file;
+            _file = null;
+            if (old != null) { try { old.Dispose(); } catch { } }
+            try { _file = OpenSource(); return true; }
+            catch { _file = null; return false; }
+        }
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeviceIoControl(SafeFileHandle h, uint code,
-            ref StartVcnInput inBuf, int inSize, byte[] outBuf, int outSize,
-            out int returned, IntPtr overlapped);
+        public ReadReport ReadAt(long offset, int length, int timeoutMs, int cancelGraceMs)
+        {
+            SafeFileHandle file = _file;
+            if (file == null || file.IsInvalid)
+            {
+                if (!Recycle())
+                    return new ReadReport { Status = "Error", Message = "The file handle could not be reopened." };
+                file = _file;
+            }
+            bool wedged;
+            ReadReport report = Watchdog.Read(file, offset, length, timeoutMs, cancelGraceMs, true, out wedged);
+            if (wedged) Recycle();
+            return report;
+        }
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool GetDiskFreeSpaceW(string root, out int sectorsPerCluster,
-            out int bytesPerSector, out int freeClusters, out int totalClusters);
+        public void Dispose()
+        {
+            if (_closed) return;
+            _closed = true;
+            SafeFileHandle file = _file;
+            _file = null;
+            if (file != null) { try { file.Dispose(); } catch { } }
+            GC.SuppressFinalize(this);
+        }
+    }
 
-        public static int ClusterSizeOf(string driveRoot)
+    // NTFS placement helpers: cluster size and physical run lookup.
+    public static class NtfsLayout
+    {
+        public static int BytesPerCluster(string driveRoot)
         {
             int spc, bps, freeC, totalC;
-            if (GetDiskFreeSpaceW(driveRoot, out spc, out bps, out freeC, out totalC))
+            if (Win.GetDiskFreeSpaceW(driveRoot, out spc, out bps, out freeC, out totalC))
                 return spc * bps;
             return 4096;
         }
 
-        // Returns long[] triples: { fileOffsetBytes, volumeOffsetBytes, lengthBytes }.
-        // volumeOffsetBytes = -1 for sparse/invalid runs.
-        public static List<long[]> GetExtents(string path, int clusterSize)
+        // Physical placement of a file on its volume. Each entry is a
+        // { fileOffset, volumeOffset, length } byte triple; volumeOffset is
+        // -1 for sparse runs. NTFS volumes only.
+        public static List<long[]> PhysicalRuns(string path, int clusterSize)
         {
             var runs = new List<long[]>();
-            SafeFileHandle h = CreateFileW(@"\\?\" + path, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            SafeFileHandle h = Win.CreateFileW(@"\\?\" + path, Win.GENERIC_READ,
+                Win.FILE_SHARE_READ | Win.FILE_SHARE_WRITE | Win.FILE_SHARE_DELETE,
+                IntPtr.Zero, Win.OPEN_EXISTING, Win.FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
             if (h.IsInvalid)
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open for extents: " + path);
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "The file could not be opened for extent lookup: " + path);
             try
             {
-                long currentVcn = 0;
-                byte[] buf = new byte[64 * 1024];
+                byte[] reply = new byte[64 * 1024];
+                long vcn = 0;
                 while (true)
                 {
-                    var input = new StartVcnInput { StartingVcn = currentVcn };
                     int returned;
-                    if (!DeviceIoControl(h, FSCTL_GET_RETRIEVAL_POINTERS, ref input,
-                        Marshal.SizeOf(typeof(StartVcnInput)), buf, buf.Length,
-                        out returned, IntPtr.Zero))
+                    if (!Win.DeviceIoControl(h, Win.FSCTL_GET_RETRIEVAL_POINTERS,
+                        BitConverter.GetBytes(vcn), 8, reply, reply.Length, out returned, IntPtr.Zero))
                     {
-                        int err = Marshal.GetLastWin32Error();
-                        if (err == ERROR_HANDLE_EOF) break;
-                        if (err == ERROR_MORE_DATA)
+                        int rc = Marshal.GetLastWin32Error();
+                        if (rc == Win.ERROR_HANDLE_EOF) break;
+                        if (rc == Win.ERROR_MORE_DATA)
                         {
-                            // Buffer too small for the next batch - grow and retry
-                            // from the same VCN so nothing is skipped.
-                            if (buf.Length >= 16 * 1024 * 1024)
-                                throw new IOException("Extents too fragmented to enumerate.");
-                            buf = new byte[buf.Length * 4];
+                            if (reply.Length >= 16 * 1024 * 1024)
+                                throw new IOException("The file is too fragmented to map its runs.");
+                            reply = new byte[reply.Length * 2];
                             continue;
                         }
-                        throw new Win32Exception(err, "FSCTL_GET_RETRIEVAL_POINTERS failed.");
+                        throw new Win32Exception(rc, "FSCTL_GET_RETRIEVAL_POINTERS did not answer.");
                     }
                     if (returned < 16) break;
-                    long startVcn = BitConverter.ToInt64(buf, 8);
-                    int extentCount = BitConverter.ToInt32(buf, 0);
-                    int pos = 16;
+                    int count = BitConverter.ToInt32(reply, 0);
+                    long startVcn = BitConverter.ToInt64(reply, 8);
+                    int cursor = 16;
                     long nextVcn = startVcn;
-                    for (int i = 0; i < extentCount; i++)
+                    for (int i = 0; i < count; i++)
                     {
-                        nextVcn = BitConverter.ToInt64(buf, pos);
-                        long lcn = BitConverter.ToInt64(buf, pos + 8);
-                        pos += 16;
-                        long fileOff = startVcn * (long)clusterSize;
-                        long len = (nextVcn - startVcn) * (long)clusterSize;
-                        long volOff = lcn < 0 ? -1 : lcn * (long)clusterSize;
-                        runs.Add(new long[] { fileOff, volOff, len });
+                        nextVcn = BitConverter.ToInt64(reply, cursor);
+                        long lcn = BitConverter.ToInt64(reply, cursor + 8);
+                        cursor += 16;
+                        long span = (nextVcn - startVcn) * (long)clusterSize;
+                        long where = lcn < 0 ? -1 : lcn * (long)clusterSize;
+                        runs.Add(new long[] { startVcn * (long)clusterSize, where, span });
                         startVcn = nextVcn;
                     }
-                    currentVcn = nextVcn;
+                    vcn = nextVcn;
                 }
             }
             finally { h.Dispose(); }
@@ -638,8 +471,8 @@ namespace DiskRescueNative
 }
 '@
 
-if (-not ('DiskRescueNative.RawDiskSession' -as [type])) {
-    Add-Type -TypeDefinition $script:DiskRescueNative -Language CSharp
+if (-not ('DiskRescueIo.DriveProbe' -as [type])) {
+    Add-Type -TypeDefinition $script:DiskRescueIo -Language CSharp
 }
 
 # ---------------------------------------------------------------------------
@@ -981,7 +814,7 @@ function Invoke-DiskRescueWorkerCommand {
                 $id = -1
                 if ($tokens.Count -ge 3 -and $tokens[2] -match '^\d+$') { $id = [int]$tokens[2] }
                 else { $id = $State.NextId; $State.NextId = $State.NextId + 1 }
-                $ses = New-Object DiskRescueNative.RawDiskSession([int]$tokens[1])
+                $ses = New-Object DiskRescueIo.DriveProbe([int]$tokens[1])
                 $State.Handles[$id] = @{ Kind = 'Disk'; Obj = $ses }
                 return ('OK {0}' -f $id)
             }
@@ -996,7 +829,7 @@ function Invoke-DiskRescueWorkerCommand {
                     $id = $State.NextId; $State.NextId = $State.NextId + 1
                 }
                 $path = ($tokens[1..($pathEnd - 1)] -join ' ')
-                $reader = New-Object DiskRescueNative.TimedFileReader($path)
+                $reader = New-Object DiskRescueIo.FileChunkReader($path)
                 $State.Handles[$id] = @{ Kind = 'File'; Obj = $reader }
                 return ('OK {0}' -f $id)
             }
@@ -1012,7 +845,7 @@ function Invoke-DiskRescueWorkerCommand {
                 $wantData = [int]$tokens[6]
                 $res = $h.Obj.ReadAt($offset, $len, $tMs, $cwMs)
                 $b64 = ''
-                if ($wantData -eq 1 -and $res.Status -eq 'Good' -and $res.BytesRead -gt 0) {
+                if ($wantData -eq 1 -and $res.Status -eq 'Good' -and $res.BytesRead -gt 0 -and $null -ne $res.Data) {
                     $b64 = [Convert]::ToBase64String($res.Data)
                 }
                 # Message goes last (may contain spaces); b64 is a single token.
@@ -1070,7 +903,7 @@ function Enter-DiskRescueWorkerLoop {
 
 class DiskRescueWorkerSession : IDisposable {
     # Parent-side handle to the worker child process. Exposes ReadAt with the
-    # same shape as the native ProbeResult/ChunkResult so scan/copy call sites
+    # same shape as the native ReadReport so scan/copy call sites
     # stay unchanged, plus a hard per-command watchdog that kills and respawns
     # a stalled worker.
     hidden [string]$_enginePath
@@ -1284,7 +1117,7 @@ class DiskRescueWorkerSession : IDisposable {
 
 class DiskRescueWorkerFileReader : IDisposable {
     # Per-file reader bound to a worker handle. ReadAt mirrors the native
-    # ChunkResult shape; Dispose closes the worker-side file handle.
+    # ReadReport shape; Dispose closes the worker-side file handle.
     hidden [DiskRescueWorkerSession]$_ses
     hidden [int]$_id
 
@@ -1372,9 +1205,9 @@ function Invoke-DiskRescueScan {
         }
     }
     if ($null -eq $mapData) {
-        $session0 = New-Object DiskRescueNative.RawDiskSession($Disk)
+        $session0 = New-Object DiskRescueIo.DriveProbe($Disk)
         try { $geom = $session0.GetGeometry() } finally { $session0.Dispose() }
-        $mapData = New-DiskRescueMap -DiskObject $diskObj -BytesPerSector $geom.BytesPerSector
+        $mapData = New-DiskRescueMap -DiskObject $diskObj -BytesPerSector $geom.SectorSize
         $mapData.TimeoutMs = $TimeoutMs
         $mapData.CancelWaitMs = $CancelWaitMs
     }
@@ -1740,7 +1573,7 @@ function Invoke-DiskRescueCopy {
     }
 
     # --- source geometry ---------------------------------------------------
-    $clusterSize = [DiskRescueNative.NtfsTools]::ClusterSizeOf(($srcLetter + ':\'))
+    $clusterSize = [DiskRescueIo.NtfsLayout]::BytesPerCluster(($srcLetter + ':\'))
     $bps = if ($null -ne $mapData) { [int]$mapData.BytesPerSector } else { 512 }
     $partOffset = [int64]0
     try {
@@ -1815,7 +1648,7 @@ function Invoke-DiskRescueCopy {
             Write-Output ('  extents {0}/{1}...' -f $n, $files.Count)
         }
         try {
-            $runs = [DiskRescueNative.NtfsTools]::GetExtents($f, $clusterSize)
+            $runs = [DiskRescueIo.NtfsLayout]::PhysicalRuns($f, $clusterSize)
             $extents[$f] = $runs
         } catch { $extentFail++ }
     }
@@ -1965,7 +1798,7 @@ function Invoke-DiskRescueCopy {
             if ($null -ne $session) {
                 $reader = $session.OpenFile($f)
             } else {
-                $reader = New-Object DiskRescueNative.TimedFileReader($f)
+                $reader = New-Object DiskRescueIo.FileChunkReader($f)
             }
             $out = [System.IO.File]::Create($target, 1 * $script:MiB, [System.IO.FileOptions]::SequentialScan)
             $c = [int64]0

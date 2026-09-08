@@ -1,14 +1,11 @@
-# SA DiskFileDigger
+# DriveStitch
 
 Standalone failing-disk rescue tool with a PySide6 GUI. Maps a failing disk's
 readable vs damaged regions with read-only watchdog-protected probes, then
 copies files off it — skipping damaged areas (zero-filled) instead of stalling
 forever. Resumable maps, per-file copy report, lost-files list.
 
-Launched via `DiskFileDigger.pyw` (requests Administrator rights through UAC
-on start — raw disk access requires elevation).
-
-## Usage
+## How it works
 
 1. **Refresh Disks** — lists the physical disks in the table.
 2. **Scan Selected...** — builds a GOOD/BAD map of the failing disk
@@ -23,14 +20,36 @@ on start — raw disk access requires elevation).
 Maps and copy reports are saved to the portable `DiskRescue` folder inside the
 app directory (any other folder can be chosen in the dialogs).
 
-## Requirements
+## Getting started
 
 - Windows 10/11, Administrator rights
 - Python 3.12+ with PySide6 (`python -m pip install -r requirements.txt`)
+- Launch `DriveStitch.pyw` — it requests Administrator rights through UAC on
+  start (raw disk access requires elevation), or run
+  `Create Desktop Shortcut.bat` once to put a shortcut with the app icon on
+  your desktop.
+
+## Development
+
+- `make_icon.py` — regenerates the multi-size application icon (`app.ico`);
+  needs Pillow (`python -m pip install pillow`).
+- `tests/test-worker.ps1` — probe-worker test suite (15 checks: protocol,
+  base64 file reads, wedge watchdog, respawn, dispose). Must run elevated;
+  raw-disk checks target a SanDisk SDSSDP064G 64 GB test disk (disk 5).
 
 ## Provenance
 
-The engine (`engine/DiskRescueLib.ps1`) is an original proprietary
-implementation (© 2026 Stavros Antoniou) inspired by the GOOD-first recovery
-concept of the [AdaptiveDisk](https://github.com/orloxgr/AdaptiveDisk) project
-(GPL-3.0). No code was taken from it. Part of the SysDigger tool suite.
+DriveStitch is inspired by the GOOD-first recovery concept of the
+[AdaptiveDisk](https://github.com/orloxgr/AdaptiveDisk) project (GPL-3.0).
+No code was taken from it: the engine (`engine/DiskRescueLib.ps1`) is an
+original implementation, and its native I/O layer is a clean-room
+implementation written from the documented Win32 APIs.
+
+Part of the SysDigger tool suite.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+Third-party components (PySide6/Qt, Pillow) are governed by their own
+licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

@@ -4,7 +4,7 @@
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
-$engine = 'C:\Users\Stavros\OneDrive\My AI Apps\SA DiskFileDigger\engine\DiskRescueLib.ps1'
+$engine = Join-Path $PSScriptRoot '..\engine\DiskRescueLib.ps1'
 . $engine
 $ErrorActionPreference = 'Continue'
 

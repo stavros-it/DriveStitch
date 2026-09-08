@@ -1,4 +1,4 @@
-# SA DiskFileDigger - Roadmap
+# DriveStitch - Roadmap
 
 Last updated: 2026-08-31
 
@@ -30,6 +30,13 @@ Validated in the field:
 - [x] Worker test suite (tests/test-worker.ps1, 15 checks): protocol,
       base64 file reads, wedge simulation (SLEEP), respawn + reopen, dispose.
       Runs elevated; log via Tee-Object.
+- [x] Clean-room rewrite of the native C# I/O block (2026-09-08): all Win32
+      interop re-implemented independently from the Microsoft documentation
+      (DriveProbe / FileChunkReader / NtfsLayout, namespace DiskRescueIo).
+      Removes any structural overlap with the GPL-3.0 AdaptiveDisk concept
+      inspiration; worker protocol, map format and behaviour unchanged.
+      Verified: 0 non-boilerplate lines shared with AdaptiveDisk; 15/15
+      worker tests + geometry check pass on the SanDisk 64 GB (disk 5).
 
 ## Next
 

@@ -1,5 +1,5 @@
-# SA DiskFileDigger - standalone failing-disk rescue tool.
-# Original work, Copyright (c) 2026 Stavros Antoniou. All rights reserved.
+# DriveStitch - standalone failing-disk rescue tool.
+# Copyright (c) 2026 Stavros Antoniou. MIT License - see LICENSE.
 #
 # Launches the PySide6 GUI. Requires Administrator privileges for raw disk
 # access - relaunches itself elevated through UAC when started normally.
@@ -28,7 +28,7 @@ def elevate() -> None:
             None,
             "Administrator privileges are required for raw disk access.\n"
             "The app was not started because the UAC prompt was cancelled.",
-            "SA DiskFileDigger",
+            "DriveStitch",
             0x10,
         )
 

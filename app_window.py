@@ -1,4 +1,4 @@
-"""SA DiskFileDigger - standalone failing-disk rescue GUI (PySide6).
+"""DriveStitch - standalone failing-disk rescue GUI (PySide6).
 
 Workflow: pick a disk from the table -> Scan (builds a GOOD/BAD map with
 watchdog-protected read-only probes) -> Copy Files (bad-aware, skips damaged
@@ -26,7 +26,7 @@ from disks import list_disks
 from runner import EngineRunner
 from scripts import DATA_DIR, STUB_COPY, STUB_LIST, STUB_LOST, STUB_REPORT, STUB_SCAN, resolve
 
-APP_TITLE = "SA DiskFileDigger - Failing Disk Rescue"
+APP_TITLE = "DriveStitch - Failing Disk Rescue"
 
 ACCENT = "#4aa3ff"
 BG = "#1b1d21"

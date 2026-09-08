@@ -1,13 +1,14 @@
-"""PowerShell script catalogue for SA DiskFileDigger.
+"""PowerShell script catalogue for DriveStitch.
 
 Each action runs as a non-interactive ``powershell.exe -File`` subprocess.
 Tokens (``__ENGINE__`` / ``__DISKRESCUE_DATA__`` / ``__INPUT__`` /
 ``__MAP__`` / ``__PROBEMIB__`` / ``__MINSTEP__`` / ``__TIMEOUTMS__`` /
 ``__DRIVE__`` / ``__DEST__``) are substituted by the GUI before launch.
 
-The engine lives in ``engine/DiskRescueLib.ps1`` - original proprietary code
-(c) Stavros Antoniou, inspired by the GOOD-first recovery concept of the
-GPL-3.0 AdaptiveDisk project. No code was taken from it.
+The engine lives in ``engine/DiskRescueLib.ps1`` - original code
+(c) 2026 Stavros Antoniou (MIT License), inspired by the GOOD-first
+recovery concept of the GPL-3.0 AdaptiveDisk project. No code was
+taken from it.
 """
 
 from __future__ import annotations
