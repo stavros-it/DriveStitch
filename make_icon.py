@@ -190,6 +190,9 @@ def main() -> int:
     frames = [draw_icon(s, simple=s in SIMPLE_SIZES) for (s, _) in ICO_SIZES]
     frames[0].save(ico_path, format="ICO", sizes=ICO_SIZES, append_images=frames[1:])
     print(f"ICO written: {ico_path}")
+    png_path = os.path.join(here, "icon.png")
+    frames[0].save(png_path, format="PNG")
+    print(f"PNG written: {png_path}")
     if len(sys.argv) > 1:
         preview(ico_path, frames[0], sys.argv[1])
         print(f"Preview written: {sys.argv[1]}")

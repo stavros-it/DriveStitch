@@ -1,5 +1,9 @@
 # DriveStitch
 
+<p align="center">
+  <img src="icon.png" alt="DriveStitch icon" width="128" />
+</p>
+
 Standalone failing-disk rescue tool with a PySide6 GUI. Maps a failing disk's
 readable vs damaged regions with read-only watchdog-protected probes, then
 copies files off it — skipping damaged areas (zero-filled) instead of stalling
@@ -31,8 +35,9 @@ app directory (any other folder can be chosen in the dialogs).
 
 ## Development
 
-- `make_icon.py` — regenerates the multi-size application icon (`app.ico`);
-  needs Pillow (`python -m pip install pillow`).
+- `make_icon.py` — regenerates the application icon (`app.ico` +
+  `icon.png` for the README); needs Pillow
+  (`python -m pip install pillow`).
 - `tests/test-worker.ps1` — probe-worker test suite (15 checks: protocol,
   base64 file reads, wedge watchdog, respawn, dispose). Must run elevated;
   raw-disk checks target a SanDisk SDSSDP064G 64 GB test disk (disk 5).
@@ -44,8 +49,6 @@ DriveStitch is inspired by the GOOD-first recovery concept of the
 No code was taken from it: the engine (`engine/DiskRescueLib.ps1`) is an
 original implementation, and its native I/O layer is a clean-room
 implementation written from the documented Win32 APIs.
-
-Part of the SysDigger tool suite.
 
 ## License
 
